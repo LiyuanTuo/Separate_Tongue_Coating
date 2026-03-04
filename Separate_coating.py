@@ -1,5 +1,5 @@
 # @Author: Liyuan Tuo, Zixuan Gu
-# @Description: 负责从二值 mask 文件夹中， 尝试区分舌苔、舌体两类区域 并保存为 coating_mask 文件夹中的 png 图片 以及 compair_kmean 文件夹中对比图，对比图左侧是去除阴影后的原图，右侧是 K-means 分割结果（黑色=苔, 灰色=体, 白色=背景）
+# @Description: 负责从二值 mask 文件夹中， 尝试区分舌苔、舌体两类区域 并保存为 coating_mask 文件夹中的 png 图片 以及 compair_kmean 文件夹中对比图，对比图左侧是去除阴影后的原图，右侧是 K-means 分割结果（黑色=体, 灰色=苔, 白色=背景）
 
 from tqdm import tqdm
 import pandas as pd
@@ -18,19 +18,12 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["LOKY_MAX_CPU_COUNT"] = "4"  # 限制 joblib 的最大进程数
 
 
-def shadow_remove(img, mask):
+def shadow_remove(img):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     V = hsv[:, :, 2]
 
-    # 当提供mask时，为了避免背景的黑色(0)影响边缘的光照估计，
-    # 我们将背景填充为mask内亮度的平均值（这一步相当于简单的边界填充/外推）
-    # 这样高斯模糊在边缘处就不会骤降
-    V_for_blur = V.copy()
-    mean_v = np.mean(V[mask])
-    V_for_blur[~mask] = int(mean_v)
-    illumination = cv2.GaussianBlur(V_for_blur, (21, 21), sigmaX=40, sigmaY=40)
+    illumination = cv2.GaussianBlur(V, (21, 21), sigmaX=40, sigmaY=40)
 
-    # 光照归一化
     # 避免除以0，添加一个小常数
     illumination = np.maximum(illumination, 1)
     V_corrected = np.clip((V.astype(np.float32) / illumination) * 255, 0, 255)
@@ -113,25 +106,18 @@ def dual_channel_kmeans_segmentation_with_mask(img_Lab, mask, n_clusters=2,
         features_scaled[:, :2] *= (1.0 - spatial_weight)  # 颜色权重
         features_scaled[:, 2:] *= spatial_weight           # 空间位置权重
 
-    # 应用K-means聚类（只在掩膜内的像素上进行）
-    kmeans = KMeans(n_clusters=n_clusters,
-                    random_state=random_state, n_init=10)
+    # 应用K-means聚类（为了避免超大分辨率下内存不足（MemoryError），改用 MiniBatchKMeans）
+    kmeans = MiniBatchKMeans(n_clusters=n_clusters,
+                             batch_size=200000,
+                             random_state=random_state, 
+                             n_init=3)
     labels_in_mask = kmeans.fit_predict(features_scaled)
 
     # 获取聚类中心（反标准化后）
     cluster_centers_scaled = kmeans.cluster_centers_
     cluster_centers = scaler.inverse_transform(cluster_centers_scaled)
 
-    # 如果使用了空间特征，聚类中心可能包含空间坐标
-    # 我们只返回原始通道的聚类中心（前两列）
-    if use_spatial_features:
-        # 从加权特征中提取原始通道的聚类中心
-        # 注意：这里需要反向计算权重
-        n_original_features = 2  # channel1和channel2
-        cluster_centers_original = cluster_centers[:,
-                                                   :n_original_features] / (1 - spatial_weight)
-    else:
-        cluster_centers_original = cluster_centers
+    
 
     # 创建完整的掩膜（包括背景区域）
     mask_inner = np.full((H, W), background_label, dtype=np.uint8)
@@ -140,20 +126,28 @@ def dual_channel_kmeans_segmentation_with_mask(img_Lab, mask, n_clusters=2,
     # 测试是否成功分类
     # print(np.unique(labels_in_mask))
 
-    return mask_inner, cluster_centers_original
+    return mask_inner, cluster_centers
 
 
 def tongue_Gb_segmentation(img, mask):
 
-    # 提取R分量                          为什么是R分量
-    # 提取b*分量
+    # 转为LAB色彩空间，LAB对分离亮度和颜色特征非常友好
     img_Lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     # 进行k聚类分割
-    mask_inner, _ = dual_channel_kmeans_segmentation_with_mask(img_Lab, mask)
-    # print(mask_inner)
-    # cv2.imshow("img", mask_inner)
-    # cv2.waitKey(0)
-    # there -1 will be converted to 255 in astype uint8, which is what we want for the background
+    mask_inner, centers = dual_channel_kmeans_segmentation_with_mask(img_Lab, mask)
+    
+    # 解决 K-Means 类别0和1混乱分配的判断逻辑：
+    # centers的形状是 (2, 3)，因为我们传入的是 LAB 3通道图像。
+    # 索引对应：0->L(亮度), 1->a(红绿色), 2->b(黄蓝色)
+    # 领域知识：舌体一般比舌苔更红！所以在纯色分布上，舌体的 a 通道均值肯定大于舌苔。
+    # 我们找出 a 通道均值更大的那个分类，强制认定它为“舌体”。
+    body_label = np.argmax(centers[:, 1])
+    
+    # 我们的目标是统一输出规范：1 对应 苔，0 对应 体。
+    # 如果判断出舌体目前的标签是 1（即 1=体，0=苔），那么在掩膜内将 0 和 1 互换。
+    if body_label == 1:
+        mask_inner[mask] = 1 - mask_inner[mask]
+
     return mask_inner
 
 
@@ -162,36 +156,7 @@ data_records = []
 valid_exts = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
 
 
-# =================读入对照组=================
-for fname in os.listdir("./对照组舌苔/对照组舌苔图像102例"):
-    ext = os.path.splitext(fname)[1].lower()
-    if ext in valid_exts:
-        full_path = os.path.join("./对照组舌苔/对照组舌苔图像102例", fname)
-        data_records.append({
-            "filename": fname,
-            "filepath": full_path
-        })
-
-for fname in os.listdir("./舌苔/1.MH健康对照组（有转录）"):
-    ext = os.path.splitext(fname)[1].lower()
-    if ext in valid_exts:
-        full_path = os.path.join("./舌苔/1.MH健康对照组（有转录）", fname)
-        data_records.append({
-            "filename": fname,
-            "filepath": full_path
-        })
-
-for fname in os.listdir("./舌苔/2.MYH健康对照（无转录）"):
-    ext = os.path.splitext(fname)[1].lower()
-    if ext in valid_exts:
-        full_path = os.path.join("./舌苔/2.MYH健康对照（无转录）", fname)
-        data_records.append({
-            "filename": fname,
-            "filepath": full_path
-        })
-
-# =================读入抑郁组=================
-for root, dirs, files in os.walk("./舌苔/3.MY抑郁组"):
+for root, dirs, files in os.walk("./img_rawdata/"):
     # print(f"正在处理抑郁组文件夹: {root}, 包含 {len(files)} 张图片 , dir 数量: {len(dirs)}")
     for fname in files:
         ext = os.path.splitext(fname)[1].lower()
@@ -218,10 +183,23 @@ all_features = []
 
 for idx, row in tqdm(df_data.iterrows(), total=len(df_data)):
     # mask读取
-    PILmask = Image.open(
-        "./mask/" + os.path.splitext(row['filename'])[0] + ".png")
-    PILmask = ImageOps.exif_transpose(PILmask)  # 处理可能的EXIF旋转
+    try:  # 处理这个逆天异常是因为三个数据集的命名完全不一致                
+        # 1 img: bmp mask: bmp              2 img: jpg mask: png                3 也就是我们自己的数据集 img: any mask: png  所以暂时这个代码不会爆炸
+        PILmask = Image.open("./mask/" + row['filename'])
+        PILmask = ImageOps.exif_transpose(PILmask)  # 处理可能的EXIF旋转
+    except FileNotFoundError:
+        PILmask = Image.open(
+            "./mask/" + os.path.splitext(row['filename'])[0] + ".png")
+        PILmask = ImageOps.exif_transpose(PILmask)  # 处理可能的EXIF旋转
+
     mask = np.array(PILmask)
+
+    # 如果 mask 是三通道（RGB），将其转为单通道灰度图
+    if len(mask.shape) == 3:
+        mask = mask[:, :, 0] 
+    
+    mask = mask.astype(np.uint8)
+    mask[mask > 0] = 255  # 确保掩膜是二值的，非零部分为255
 
     print(f"正在处理图片: {row['filename']}")
     PILimg = Image.open(row['filepath']).convert("RGB")
@@ -249,10 +227,7 @@ for idx, row in tqdm(df_data.iterrows(), total=len(df_data)):
     # cv2.imshow("img_initial", cv2.resize(img_initial, display_size))
 
     # 亮度均衡化
-    img_unshadowed = shadow_remove(img_initial, mask)
-    # cv2.imshow("img_unshadowed", cv2.resize(img_unshadowed, display_size))
-
-    # cv2.waitKey(0)
+    img_unshadowed = shadow_remove(img_initial)
 
     # 图像分割
     mask_inner = tongue_Gb_segmentation(
@@ -260,19 +235,19 @@ for idx, row in tqdm(df_data.iterrows(), total=len(df_data)):
 
     # 0(第一类) -> 黑色(0)
     # 1(第二类) -> 灰色(128)
-    # -1(背景)  -> 白色(255)
+    # 255 (背景)  -> 白色(255)
     mask_inner[mask_inner == 1] = 128
 
     mask_inner = Image.fromarray(mask_inner)
     mask_inner.save(f"./coating_mask/" +
-                    os.path.splitext(row['filename'])[0] + ".png")
+                    row['filename'])
 
     # --- 替换 matplotlib 绘图保存逻辑，改用 cv2 直接拼接保存，防止内存泄漏 ---
 
-    # 1. 准备左图：Unshadowed (BGR)
-    # img_unshadowed 已经是 BGR，且非 mask 区域已经处理过（可选：确保背景是白色）
+    # 1. 准备左图： (BGR)
+    # img_initial 已经是 BGR，且非 mask 区域已经处理过（可选：确保背景是白色）
 
-    img_unshadowed[~mask] = [255, 255, 255]
+    img_initial[~mask] = [255, 255, 255]
 
     # 2. 准备右图：K-means Result (Grayscale -> BGR)
     # mask_inner 是 (H, W) 的单通道，0=苔, 128=体, 255=背景
@@ -283,11 +258,10 @@ for idx, row in tqdm(df_data.iterrows(), total=len(df_data)):
     # 确保两张图的高度一致（通常是一致的，因为都来自原图尺寸）
     # 中间可以加一条黑线或白线分隔
     sep_line = np.zeros((H, 10, 3), dtype=np.uint8)  # 10像素宽的黑线
-    img_combined = np.hstack([img_unshadowed, sep_line, img_right])
-
-    # 4. 添加文字说明 (可选)
-    # cv2.putText(img_combined, "Unshadowed", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    img_combined = np.hstack([img_initial, sep_line, img_right])
 
     # 5. 保存
-    save_path = f"./compair_kmean/{os.path.splitext(row['filename'])[0]}.png"
-    cv2.imwrite(save_path, img_combined)
+    save_path = f"./compair_kmean/{row['filename']}"
+    # 使用 cv2.imencode 替代 cv2.imwrite 解决中文路径保存问题
+    cv2.imencode('.png', img_combined)[1].tofile(save_path)
+
