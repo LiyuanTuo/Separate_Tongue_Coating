@@ -8,3 +8,8 @@ resnet_test.pth
 /__pycache__
 /img_rawdata
 cp.ps1
+*.zip
+image_features.py
+models.py
+imgdataset.py
+feature_alignment_modules.py
